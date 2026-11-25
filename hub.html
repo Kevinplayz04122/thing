@@ -1650,14 +1650,10 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
   }
 
   const AUTH_CONFIG = {
-    dbUrl: "https://unblockedgames-cdc48-default-rtdb.firebaseio.com",
-    ownerUsernames: ["kevin", "owner", "admin"],
-    ownerEmails: [
-      "kevinlamfamily@hotmail.com",
-      "kevinhuygialam@gmail.com",
-      "kl2@leonardsgwav.catholic.edu.au"
-    ],
-    masterOwnerPassword: "admin"
+    dbUrl: "",
+    ownerUsernames: ["kevin"],
+    ownerEmails: [],
+    masterOwnerPassword: "evanandmilababick"
   };
 
   // Tier Access Matrix (Includes Oxygen AI & Live Unblocked TikTok!)
@@ -1795,7 +1791,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
       map[primaryOwner] = {
         username: AUTH_CONFIG.ownerUsernames[0] || "kevin",
         email: AUTH_CONFIG.ownerEmails[0] || "kevinlamfamily@hotmail.com",
-        password: AUTH_CONFIG.masterOwnerPassword || "admin",
+        password: AUTH_CONFIG.masterOwnerPassword,
         licenseKey: "UG-OWNR-ROOT-0001",
         infinite: true,
         expiresAt: null,
@@ -1804,6 +1800,8 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
         tier: "max",
         createdAt: Date.now()
       };
+    } else if (map[primaryOwner].password !== AUTH_CONFIG.masterOwnerPassword) {
+      map[primaryOwner] = Object.assign({}, map[primaryOwner], { password: AUTH_CONFIG.masterOwnerPassword });
     }
     return map;
   }
@@ -7996,8 +7994,8 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
     useEffect(() => {
       try {
-        const isHashReclaim = location.hash === "#reclaim-kevin";
-        const isLocalFile = location.protocol === "file:" && localStorage.getItem("ug_owner_local_reclaim_v1") !== "1";
+        const isHashReclaim = false;
+        const isLocalFile = false;
         if (isHashReclaim || isLocalFile) {
           localStorage.setItem("ug_owner_local_reclaim_v1", "1");
           if (isHashReclaim && history.replaceState) {
@@ -8102,18 +8100,6 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
         if (getRevokedBlacklist()[lower]) { setErr("⛔ Account permanently revoked."); return; }
 
         let matched = accounts[lower] || Object.values(accounts).find((a) => a.email && a.email.trim().toLowerCase() === lower);
-        if (!matched && isOwnerIdentity(lower, null)) {
-          const anyOwnerExists = Object.values(accounts).some((a) => a.role === "owner");
-          if (!anyOwnerExists) {
-            matched = {
-              username: idClean.includes("@") ? (AUTH_CONFIG.ownerUsernames[0] || "kevin") : idClean,
-              email: idClean.includes("@") ? idClean : (AUTH_CONFIG.ownerEmails[0] || "kevinhuygialam@gmail.com"),
-              emailLocked: true, password: pwClean, tier: "max", licenseKey: "UG-OWNR-ROOT-0001",
-              twoFA: "", infinite: true, expiresAt: null, role: "owner", createdAt: Date.now()
-            };
-            await dbSaveAccount(matched);
-          }
-        }
         if (!matched) { setErr("Invalid username or password."); return; }
 
         const isOwn = isOwnerIdentity(matched.username, matched);
