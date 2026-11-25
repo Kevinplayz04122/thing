@@ -1658,10 +1658,10 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
   // Tier Access Matrix (Includes Oxygen AI & Live Unblocked TikTok!)
   const TIER_PERMISSIONS = {
-    free: ["home", "games", "movies", "music", "ai", "tiktok", "account", "settings"],
-    pro: ["home", "chat", "games", "movies", "music", "ai", "tiktok", "account", "settings"],
-    premium: ["home", "youtube", "tiktok", "browser", "chat", "games", "movies", "music", "ai", "account", "settings"],
-    max: ["home", "sports", "broadcast", "youtube", "tiktok", "browser", "chat", "games", "movies", "music", "ai", "account", "settings"],
+    free: ["home", "games", "movies", "music", "ai", "account", "settings"],
+    pro: ["home", "chat", "games", "movies", "music", "ai", "account", "settings"],
+    premium: ["home", "youtube", "browser", "chat", "games", "movies", "music", "ai", "account", "settings"],
+    max: ["home", "sports", "broadcast", "youtube", "browser", "chat", "games", "movies", "music", "ai", "account", "settings"],
     owner: ["home", "blooket", "sports", "broadcast", "youtube", "tiktok", "browser", "chat", "games", "movies", "music", "ai", "account", "settings", "creator"]
   };
 
@@ -1679,7 +1679,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
   }
 
   function requiredTierForView(viewId) {
-    if (viewId === "creator" || viewId === "blooket") return "Owner";
+    if (viewId === "creator" || viewId === "blooket" || viewId === "tiktok") return "Owner";
     if (viewId === "sports" || viewId === "broadcast") return "MAX";
     if (viewId === "chat") return "Pro";
     if (viewId === "youtube" || viewId === "browser") return "Premium";
@@ -4162,10 +4162,10 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
           h(BrandDiscord),
           "Discord"
         ),
-        h("button", { className: "ox-shortcut-pill", onClick: () => onNavigate("tiktok") },
+        canAccessView(userTier, "tiktok") ? h("button", { className: "ox-shortcut-pill", onClick: () => onNavigate("tiktok") },
           h(BrandTikTok),
           "TikTok"
-        ),
+        ) : null,
         h("button", { className: "ox-shortcut-pill", onClick: () => onNavigate("games") },
           h(BrandGames),
           "Games"
