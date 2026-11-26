@@ -1777,10 +1777,17 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     crypto.getRandomValues(a);
     return String(a[0] % 100000000).padStart(8, "0");
   }
+  const memLocalStore = {};
+  let memSavedSession = null;
   function getLocalStore(key) {
-    try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; }
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return memLocalStore[key] ? JSON.parse(JSON.stringify(memLocalStore[key])) : {};
   }
   function setLocalStore(key, val) {
+    memLocalStore[key] = val || {};
     try {
       localStorage.setItem(key, JSON.stringify(val || {}));
       if (bc) bc.postMessage({ type: "store_updated", key });
@@ -1858,15 +1865,20 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     return { username: saved.username, email: saved.email || "", role: owner ? "owner" : "user",
       tier: owner ? "max" : (saved.tier || "free"), infinite: true, expiresAt: null, durationHours: null };
   }
-  async function serverSync() {
+  async function serverSync(presence) {
     const empty = { accounts: {}, sessions: {}, broadcast: null };
     const saved = getSavedSession();
     if (!saved || !saved.username || !getServerToken()) return empty;
     const key = String(saved.username).toLowerCase();
     try {
-      const s = await serverCall("GET", "/sync");
+      const s = presence ? await serverCall("POST", "/sync", presence) : await serverCall("GET", "/sync");
       if (s.status === 401 || s.status === 403) { setServerToken(""); return empty; }
       if (!s.ok || !s.data.account) throw new Error("sync failed");
+      if (s.data.kicked) {
+        setServerToken("");
+        const kickedSess = { username: saved.username, kicked: true, kickedAt: s.data.kickedAt || Date.now() };
+        return { accounts: { [key]: s.data.account }, sessions: { [key]: kickedSess }, broadcast: null };
+      }
       const acc = s.data.account;
       const me = String(acc.username).toLowerCase();
       let accounts = { [me]: acc };
@@ -1881,18 +1893,20 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
         }
         accounts = Object.assign({}, serverOwnerList, accounts);
       }
+      const liveSessions = s.data.sessions && typeof s.data.sessions === "object" ? s.data.sessions : {};
       setLocalStore(LS_ACCOUNTS, { [me]: acc });
-      return { accounts, sessions: {}, broadcast: s.data.broadcast || null };
+      setLocalStore(LS_SESSIONS, liveSessions);
+      return { accounts, sessions: liveSessions, broadcast: s.data.broadcast || null };
     } catch {
       // network trouble: keep the person signed in with the last known account
       const accounts = Object.assign({}, serverOwnerList, getLocalStore(LS_ACCOUNTS));
       if (!accounts[key]) accounts[key] = accountFromSession(saved);
-      return { accounts, sessions: {}, broadcast: null };
+      return { accounts, sessions: getLocalStore(LS_SESSIONS), broadcast: null };
     }
   }
 
-  async function dbFetchAll() {
-    if (isServerMode()) return await serverSync();
+  async function dbFetchAll(presence) {
+    if (isServerMode()) return await serverSync(presence);
     const base = getDbUrl();
     const localAcc = ensureDefaultOwner(getLocalStore(LS_ACCOUNTS));
     const localSess = getLocalStore(LS_SESSIONS);
@@ -1924,6 +1938,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     };
     if (isServerMode()) {
       try { await serverCall("PUT", "/broadcast", safePayload); } catch {}
+      if (bc) bc.postMessage({ type: "live_broadcast", payload: safePayload });
       return;
     }
     setLocalStore(LS_BROADCAST, safePayload);
@@ -1938,6 +1953,87 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
         });
       } catch {}
     }
+  }
+
+  async function dbFetchMessages() {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - DAY_MS;
+    if (isServerMode()) {
+      if (!getServerToken()) return [];
+      try {
+        const r = await serverCall("GET", "/messages");
+        if (r.status === 401 || r.status === 403) return [];
+        if (r.ok && Array.isArray(r.data.messages)) {
+          const fresh = r.data.messages.filter((m) => m && (m.timestamp || 0) >= cutoff);
+          fresh.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+          try { localStorage.setItem("ug_global_chat_v1", JSON.stringify(fresh)); } catch {}
+          return fresh;
+        }
+      } catch {}
+      try {
+        const cached = JSON.parse(localStorage.getItem("ug_global_chat_v1") || "[]");
+        return cached.filter((m) => m && (m.timestamp || 0) >= cutoff);
+      } catch { return []; }
+    }
+    const base = getDbUrl();
+    if (!base) return null;
+    try {
+      const res = await fetch(base + '/global_chat.json?orderBy="$key"&limitToLast=30', { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        if (!data) {
+          try { localStorage.setItem("ug_global_chat_v1", "[]"); } catch {}
+          return [];
+        }
+        const list = Object.keys(data).map((k) => Object.assign({ id: k }, data[k]));
+        const fresh = list.filter((m) => m && (m.timestamp || 0) >= cutoff);
+        fresh.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        try { localStorage.setItem("ug_global_chat_v1", JSON.stringify(fresh)); } catch {}
+        Object.keys(data).forEach((k) => {
+          const item = data[k];
+          if (item && (item.timestamp || 0) < cutoff) {
+            fetch(base + "/global_chat/" + encodeURIComponent(k) + ".json", { method: "DELETE" }).catch(() => {});
+          }
+        });
+        return fresh;
+      }
+    } catch {}
+    return null;
+  }
+
+  async function dbSendMessage(msgObj) {
+    if (isServerMode()) {
+      const r = await serverCall("POST", "/messages", {
+        text: msgObj.text || "",
+        attachment: msgObj.attachment || null
+      });
+      if (!r.ok) throw new Error((r.data && r.data.error) || "Failed to send message");
+      if (Array.isArray(r.data.messages)) {
+        try { localStorage.setItem("ug_global_chat_v1", JSON.stringify(r.data.messages)); } catch {}
+      }
+      return r.data.message || null;
+    }
+    const base = getDbUrl();
+    if (base) {
+      try {
+        await fetch(base + "/global_chat.json", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(msgObj)
+        });
+      } catch {}
+    }
+    return null;
+  }
+
+  async function dbDeleteMessage(msgId) {
+    if (isServerMode()) {
+      const path = msgId ? "/messages/" + encodeURIComponent(msgId) : "/messages";
+      const r = await serverCall("DELETE", path);
+      if (!r.ok) throw new Error((r.data && r.data.error) || "Failed to delete message");
+      const next = Array.isArray(r.data.messages) ? r.data.messages : [];
+      try { localStorage.setItem("ug_global_chat_v1", JSON.stringify(next)); } catch {}
+      return next;
+    }
+    return null;
   }
 
   async function dbSaveAccount(acc) {
@@ -1996,6 +2092,15 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
   async function dbUpsertSession(sess) {
     const key = sess.username.trim().toLowerCase();
+    if (isServerMode()) {
+      if (sess.kicked) {
+        try { await serverCall("POST", "/admin/kick", { username: sess.username }); } catch {}
+      }
+      const localSess = getLocalStore(LS_SESSIONS);
+      localSess[key] = sess;
+      setLocalStore(LS_SESSIONS, localSess);
+      return;
+    }
     const localSess = getLocalStore(LS_SESSIONS);
     localSess[key] = sess;
     setLocalStore(LS_SESSIONS, localSess);
@@ -2029,9 +2134,10 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
   function getSavedSession() {
     try { const raw = localStorage.getItem(LS_CURRENT_USER); if (raw) return JSON.parse(raw); } catch {}
-    return null;
+    return memSavedSession;
   }
   function saveCurrentSession(sess) {
+    memSavedSession = sess || null;
     try {
       if (!sess) localStorage.removeItem(LS_CURRENT_USER);
       else localStorage.setItem(LS_CURRENT_USER, JSON.stringify(sess));
@@ -7196,44 +7302,25 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     });
     const [inputMessage, setInputMessage] = useState("");
     const [attachment, setAttachment] = useState(null);
+    const [chatErr, setChatErr] = useState("");
     const messagesEndRef = useRef(null);
     const hasInitializedScroll = useRef(false);
-
-    const purgeAndSetMessages = useCallback((rawList, rawData, base) => {
-      const cutoff = Date.now() - DAY_MS;
-      const fresh = (rawList || []).filter((m) => m && (m.timestamp || 0) >= cutoff);
-      fresh.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-      try { localStorage.setItem("ug_global_chat_v1", JSON.stringify(fresh)); } catch {}
-      setMessages(fresh);
-      if (base && rawData) {
-        Object.keys(rawData).forEach((k) => {
-          const item = rawData[k];
-          if (item && (item.timestamp || 0) < cutoff) {
-            fetch(base + "/global_chat/" + encodeURIComponent(k) + ".json", { method: "DELETE" }).catch(() => {});
-          }
-        });
-      }
-    }, [DAY_MS]);
+    const viewerIsOwner = currentUser && isOwnerIdentity(currentUser.username, accountsMap?.[currentUser.username?.toLowerCase()] || currentUser);
 
     const fetchChat = useCallback(async () => {
-      const base = getDbUrl();
-      if (!base) return;
-      try {
-        const res = await fetch(base + '/global_chat.json?orderBy="$key"&limitToLast=30', { cache: "no-store" });
-        if (res.ok) {
-          const data = await res.json();
-          if (data) {
-            const list = Object.keys(data).map((k) => Object.assign({ id: k }, data[k]));
-            purgeAndSetMessages(list, data, base);
-          } else setMessages([]);
-        }
-      } catch {}
-    }, [purgeAndSetMessages]);
+      const remoteList = await dbFetchMessages();
+      if (Array.isArray(remoteList)) setMessages(remoteList);
+    }, []);
 
     useEffect(() => {
       fetchChat();
-      const interval = setInterval(fetchChat, 2500);
-      return () => clearInterval(interval);
+      const interval = setInterval(fetchChat, isServerMode() ? 4000 : 2500);
+      const onBc = (ev) => { if (ev.data && ev.data.type === "chat_message_sent") fetchChat(); };
+      if (bc) bc.addEventListener("message", onBc);
+      return () => {
+        clearInterval(interval);
+        if (bc) bc.removeEventListener("message", onBc);
+      };
     }, [fetchChat]);
 
     useEffect(() => {
@@ -7246,14 +7333,26 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     const handleFileChange = (e) => {
       const file = e.target.files[0];
       if (!file) return;
-      if (file.size > 2 * 1024 * 1024) { alert("File size must be under 2MB for cloud sync."); return; }
+      if (file.size > 2 * 1024 * 1024) { setChatErr("File size must be under 2MB for cloud sync."); return; }
+      setChatErr("");
       const reader = new FileReader();
       reader.onload = (ev) => setAttachment({ name: file.name, type: file.type, data: ev.target.result });
       reader.readAsDataURL(file);
     };
 
+    const handleDeleteMsg = async (id) => {
+      try {
+        const next = await dbDeleteMessage(id);
+        if (Array.isArray(next)) setMessages(next);
+        if (bc) bc.postMessage({ type: "chat_message_sent" });
+      } catch (err) {
+        setChatErr(String((err && err.message) || "Could not delete message"));
+      }
+    };
+
     const sendMessage = async (e) => {
       e.preventDefault();
+      setChatErr("");
       const text = inputMessage.trim();
       if (!text && !attachment) return;
       if (!currentUser) return;
@@ -7276,19 +7375,15 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
       setInputMessage("");
       setAttachment(null);
 
-      const base = getDbUrl();
-      if (base) {
-        try {
-          await fetch(base + "/global_chat.json", {
-            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(newMsg)
-          });
-        } catch {}
-      }
-      if (bc) bc.postMessage({ type: "chat_message_sent" });
-      setTimeout(async () => {
+      try {
+        await dbSendMessage(newMsg);
+        if (bc) bc.postMessage({ type: "chat_message_sent" });
         await fetchChat();
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-      }, 150);
+      } catch (err) {
+        setChatErr(String((err && err.message) || "Could not send message"));
+        await fetchChat();
+      }
     };
 
     const onlinePeers = Object.values(sessionsMap || {}).filter((s) => s && !s.kicked && Date.now() - (s.lastPing || 0) < 45000);
@@ -7298,10 +7393,16 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
         h("div", { style: { display: "flex", alignItems: "center", gap: 10 } },
           h("h2", { style: { margin: 0, fontSize: 24 } }, "oxygen chat"),
           h("span", { className: "badge-pill live" }, `${onlinePeers.length} ONLINE`),
-          h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "Auto-purges every 24h")
+          h("span", { style: { fontSize: 12, color: "var(--muted)" } }, isServerMode() ? "Cloudflare Live Sync • 24h auto-purge" : "Auto-purges every 24h")
         ),
-        h("button", { className: "btn ghost sm", onClick: () => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }) }, "⬇ Bottom")
+        h("div", { style: { display: "flex", gap: 8 } },
+          viewerIsOwner && isServerMode() && messages.length > 0
+            ? h("button", { className: "btn danger sm", onClick: () => handleDeleteMsg("") }, "Clear Chat")
+            : null,
+          h("button", { className: "btn ghost sm", onClick: () => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }) }, "⬇ Bottom")
+        )
       ),
+      chatErr ? h("div", { style: { margin: "8px 24px 0", padding: "8px 12px", borderRadius: 8, background: "rgba(239,68,68,0.16)", border: "1px solid rgba(239,68,68,0.4)", color: "#fca5a5", fontSize: 12 } }, chatErr) : null,
 
       onlinePeers.length > 0 ? h("div", { style: { display: "flex", gap: 8, overflowX: "auto", padding: "10px 24px 0", flexShrink: 0 } },
         onlinePeers.map((p) =>
@@ -7340,7 +7441,15 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
                       renderTierBadge(m.tier, isMsgOwner),
                       h("span", { style: { fontSize: 10.5, color: "var(--muted)", marginLeft: "auto" } },
                         new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-                      )
+                      ),
+                      isServerMode() && m.id && !String(m.id).startsWith("msg_opt_") && (viewerIsOwner || isMe)
+                        ? h("button", {
+                            type: "button",
+                            onClick: () => handleDeleteMsg(m.id),
+                            title: "Delete message",
+                            style: { border: 0, background: "transparent", color: "var(--muted)", cursor: "pointer", fontSize: 13, padding: "0 2px", lineHeight: 1 }
+                          }, "×")
+                        : null
                     ),
                     m.text ? h("div", { style: { fontSize: 13.5, lineHeight: 1.45, wordBreak: "break-word" } }, m.text) : null,
                     m.attachment ? h("div", { style: { marginTop: 8 } },
@@ -7570,7 +7679,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
             h("p", { className: "sub", style: { margin: "6px 0 0" } }, "Create licensed accounts, assign Free / Pro / Premium / MAX tiers, and monitor live Oxygen activity.")
           ),
           h("div", { style: { display: "flex", gap: 10, flexWrap: "wrap" } },
-            h("button", { className: "btn ghost", onClick: () => setDbModal(true) }, getDbUrl() ? "☁️ Cloud DB Connected" : "⚙️ Cloud DB Setup"),
+            h("button", { className: "btn ghost", onClick: () => setDbModal(true) }, isServerMode() ? "☁️ Cloudflare Server Connected" : (getDbUrl() ? "☁️ Cloud DB Connected" : "⚙️ Cloud DB Setup")),
             h("button", { className: "btn", onClick: () => setCreateModal(true) }, "+ Create Account")
           )
         ),
@@ -7643,7 +7752,9 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
               h("div", { style: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 14, background: "#08080b", padding: "11px 13px", borderRadius: 12, border: "1px solid var(--border)" } },
                 h("div", { className: "row" }, h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "Password"),
                   h("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
-                    h("span", { style: { fontSize: 13, fontWeight: 600, fontFamily: "monospace" } }, isShown ? acc.password : "••••••••"),
+                    h("span", { style: { fontSize: 13, fontWeight: 600, fontFamily: "monospace" } },
+                      isShown ? (acc.password || (isServerMode() ? "PBKDF2 Hash (Set below)" : "")) : "••••••••"
+                    ),
                     h("button", { className: "eye-btn", onClick: () => toggleReveal(key) }, isShown ? h(EyeOffIcon) : h(EyeIcon))
                   )
                 ),
@@ -7658,9 +7769,9 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
                         h("option", { value: "max" }, "🔥 MAX (+ ESPN & Broadcast)")
                       )
                 ),
-                h("div", { className: "row" }, h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "License"), h("span", { style: { fontSize: 11.5, fontFamily: "monospace", color: "#bcbcc4" } }, acc.licenseKey)),
-                h("div", { className: "row" }, h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "2FA Email"), h("span", { style: { fontSize: 11.5, fontFamily: "monospace", color: acc.email ? "#86efac" : "var(--muted)" } }, acc.email ? ("🔒 " + acc.email) : "Locks on 1st Login")),
-                h("div", { className: "row" },
+                h("div", { className: "row" }, h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "License"), h("span", { style: { fontSize: 11.5, fontFamily: "monospace", color: "#bcbcc4" } }, acc.licenseKey || (isOwn ? "OWNER-ROOT" : ""))),
+                isServerMode() ? null : h("div", { className: "row" }, h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "2FA Email"), h("span", { style: { fontSize: 11.5, fontFamily: "monospace", color: acc.email ? "#86efac" : "var(--muted)" } }, acc.email ? ("🔒 " + acc.email) : "Locks on 1st Login")),
+                isServerMode() ? null : h("div", { className: "row" },
                   h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "2FA Code"),
                   h("div", { style: { display: "flex", alignItems: "center", gap: 6 } },
                     h("span", { style: { fontSize: 13, fontWeight: 600, fontFamily: "monospace" } }, acc.twoFA ? (revealedPw["2fa_" + key] ? acc.twoFA : "••••••••") : "NONE"),
@@ -7725,13 +7836,22 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
       ) : null,
 
       dbModal ? h(Modal, { onClose: () => setDbModal(false) },
-        h("h3", null, "Real-Time Cloud Database"),
-        h("p", null, "Paste your Firebase Realtime Database URL below."),
-        h("input", { className: "field", value: dbUrlInput, onChange: (e) => setDbUrlInput(e.target.value), style: { marginBottom: 14 } }),
-        h("div", { className: "actions" },
-          h("button", { className: "btn", onClick: async () => { setCustomDbUrl(dbUrlInput); await onRefresh(); setDbModal(false); toast("Cloud DB saved!"); } }, "Save"),
-          h("button", { className: "btn ghost", onClick: () => setDbModal(false) }, "Close")
-        )
+        isServerMode()
+          ? h(Fragment, null,
+              h("h3", null, "☁️ Cloudflare Worker + KV Backend"),
+              h("p", null, "Connected to your live Cloudflare server storing accounts, PBKDF2 password hashes, broadcasts, 24h chat messages, and live sessions:"),
+              h("div", { className: "mono-box", style: { fontSize: 13, marginBottom: 14, wordBreak: "break-all" } }, getServerUrl()),
+              h("div", { className: "actions" }, h("button", { className: "btn", onClick: () => setDbModal(false) }, "Close"))
+            )
+          : h(Fragment, null,
+              h("h3", null, "Real-Time Cloud Database"),
+              h("p", null, "Paste your Firebase Realtime Database URL below."),
+              h("input", { className: "field", value: dbUrlInput, onChange: (e) => setDbUrlInput(e.target.value), style: { marginBottom: 14 } }),
+              h("div", { className: "actions" },
+                h("button", { className: "btn", onClick: async () => { setCustomDbUrl(dbUrlInput); await onRefresh(); setDbModal(false); toast("Cloud DB saved!"); } }, "Save"),
+                h("button", { className: "btn ghost", onClick: () => setDbModal(false) }, "Close")
+              )
+            )
       ) : null,
 
       codeInfo ? h(Modal, { onClose: () => setCodeInfo(null) },
@@ -8766,11 +8886,18 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     };
 
     const refreshDatabaseAndSession = useCallback(async () => {
-      const { accounts, sessions, broadcast } = await dbFetchAll();
+      const saved = getSavedSession();
+      const baseRoute = activeRoute.startsWith("game:") ? "games" : activeRoute;
+      const presence = isServerMode() && saved && saved.username ? {
+        sessionId: saved.sessionId || TAB_SESSION_ID,
+        loginAt: saved.loginAt || Date.now(),
+        currentView: baseRoute,
+        activity: activityString
+      } : undefined;
+      const { accounts, sessions, broadcast } = await dbFetchAll(presence);
       setAccountsMap(accounts);
       setSessionsMap(sessions);
 
-      const saved = getSavedSession();
       if (!saved || !saved.username) { setCurrentUser(null); return; }
 
       const key = saved.username.trim().toLowerCase();
@@ -8790,29 +8917,30 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
       if (broadcast && broadcast.id) checkIncomingBroadcast(broadcast, acc.username);
 
       const liveTier = getUserTier(acc, own);
-      const baseRoute = activeRoute.startsWith("game:") ? "games" : activeRoute;
       if (!canAccessView(liveTier, baseRoute)) {
         navigateRoute("home");
       }
 
-      await dbUpsertSession({
-        username: acc.username,
-        email: acc.email || "",
-        role: own ? "owner" : "user",
-        tier: liveTier,
-        sessionId: saved.sessionId || TAB_SESSION_ID,
-        loginAt: saved.loginAt || Date.now(),
-        lastPing: Date.now(),
-        currentView: baseRoute,
-        activity: activityString,
-        kicked: false
-      });
-      setSessionsMap(getLocalStore(LS_SESSIONS));
+      if (!isServerMode()) {
+        await dbUpsertSession({
+          username: acc.username,
+          email: acc.email || "",
+          role: own ? "owner" : "user",
+          tier: liveTier,
+          sessionId: saved.sessionId || TAB_SESSION_ID,
+          loginAt: saved.loginAt || Date.now(),
+          lastPing: Date.now(),
+          currentView: baseRoute,
+          activity: activityString,
+          kicked: false
+        });
+        setSessionsMap(getLocalStore(LS_SESSIONS));
+      }
     }, [activeRoute, activityString, toast, checkIncomingBroadcast, navigateRoute]);
 
     useEffect(() => {
       refreshDatabaseAndSession();
-      const interval = setInterval(refreshDatabaseAndSession, isServerMode() ? 45000 : 3500);
+      const interval = setInterval(refreshDatabaseAndSession, isServerMode() ? 8000 : 3500);
       return () => clearInterval(interval);
     }, [refreshDatabaseAndSession]);
 
