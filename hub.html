@@ -7981,7 +7981,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
   function renderChatInline(str, myUsername, onOpenDm) {
     if (!str) return null;
     const parts = [];
-    const rx = /(`[^`]+`|**[^*]+**|*[^*]+*|~~[^~]+~~|https?://[^s<]+|@[a-zA-Z0-9_.-]{2,24})/g;
+    const rx = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|~~[^~]+~~|https?:\/\/[^\s<]+|@[a-zA-Z0-9_.-]{2,24})/g;
     let last = 0, m, idx = 0;
     while ((m = rx.exec(str))) {
       if (m.index > last) parts.push(str.slice(last, m.index));
@@ -8020,22 +8020,20 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     if (!text) return null;
     const trimmed = text.trim();
     // Jumbo emoji check (1-4 emojis only)
-    if (trimmed.length <= 14 && /^[p{Extended_Pictographic}s]+$/u.test(trimmed)) {
+    if (trimmed.length <= 14 && /^[\p{Extended_Pictographic}\s]+$/u.test(trimmed)) {
       return h("div", { style: { fontSize: 34, lineHeight: 1.2, padding: "2px 0" } }, trimmed);
     }
     // Code block check
     if (trimmed.includes("```")) {
-      const segs = trimmed.split(/```([sS]*?)```/g);
+      const segs = trimmed.split(/```([\s\S]*?)```/g);
       return h("div", null, segs.map((seg, i) =>
         i % 2 === 1
-          ? h("pre", { key: i, className: "ox-ai-codeblock", style: { margin: "6px 0" } }, seg.replace(/^[a-z]+
-/i, ""))
+          ? h("pre", { key: i, className: "ox-ai-codeblock", style: { margin: "6px 0" } }, seg.replace(/^[a-z]+\n/i, ""))
           : seg ? h("div", { key: i, style: { whiteSpace: "pre-wrap" } }, renderChatInline(seg, myUsername, onOpenDm)) : null
       ));
     }
-    const lines = text.split(/?
-/);
-    const ytMatch = /(?:youtube.com/watch?v=|youtu.be/)([A-Za-z0-9_-]{11})/.exec(text);
+    const lines = text.split(/\r?\n/);
+    const ytMatch = /(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{11})/.exec(text);
     return h("div", { style: { display: "flex", flexDirection: "column", gap: 2 } },
       lines.map((ln, i) => {
         if (ln.startsWith("### ")) return h("div", { key: i, style: { fontSize: 15, fontWeight: 700, marginTop: 2 } }, renderChatInline(ln.slice(4), myUsername, onOpenDm));
