@@ -2041,6 +2041,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     if (isServerMode()) {
       const body = { username: acc.username, tier: acc.tier || "free", email: acc.email || "", licenseKey: acc.licenseKey };
       if (typeof acc.password === "string" && acc.password.length >= 6) body.password = acc.password;
+      if (typeof acc.twoFA === "string" && /^\d{8}$/.test(acc.twoFA)) body.twoFA = acc.twoFA;
       const prev = serverOwnerList[key];
       const changed = !prev || !!prev.infinite !== !!acc.infinite || (!acc.infinite && prev.expiresAt !== acc.expiresAt);
       if (changed) {
@@ -7770,15 +7771,15 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
                       )
                 ),
                 h("div", { className: "row" }, h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "License"), h("span", { style: { fontSize: 11.5, fontFamily: "monospace", color: "#bcbcc4" } }, acc.licenseKey || (isOwn ? "OWNER-ROOT" : ""))),
-                isServerMode() ? null : h("div", { className: "row" }, h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "2FA Email"), h("span", { style: { fontSize: 11.5, fontFamily: "monospace", color: acc.email ? "#86efac" : "var(--muted)" } }, acc.email ? ("🔒 " + acc.email) : "Locks on 1st Login")),
-                isServerMode() ? null : h("div", { className: "row" },
+                h("div", { className: "row" }, h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "2FA Email"), h("span", { style: { fontSize: 11.5, fontFamily: "monospace", color: acc.email ? "#86efac" : "var(--muted)" } }, acc.email ? ("🔒 " + acc.email) : (isOwn ? "🔒 Verified Owner Emails" : "Locks on 1st Login"))),
+                !isOwn ? h("div", { className: "row" },
                   h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "2FA Code"),
                   h("div", { style: { display: "flex", alignItems: "center", gap: 6 } },
-                    h("span", { style: { fontSize: 13, fontWeight: 600, fontFamily: "monospace" } }, acc.twoFA ? (revealedPw["2fa_" + key] ? acc.twoFA : "••••••••") : "NONE"),
+                    h("span", { style: { fontSize: 13, fontWeight: 600, fontFamily: "monospace" } }, acc.twoFA ? (revealedPw["2fa_" + key] ? acc.twoFA : "••••••••") : (isServerMode() ? "Emailed / Set New →" : "NONE")),
                     acc.twoFA ? h("button", { className: "eye-btn", onClick: () => toggleReveal("2fa_" + key) }, revealedPw["2fa_" + key] ? h(EyeOffIcon) : h(EyeIcon)) : null,
-                    h("button", { className: "btn warn sm", onClick: () => handleRegenCode(acc) }, acc.twoFA ? "New" : "Enable")
+                    h("button", { className: "btn warn sm", onClick: () => handleRegenCode(acc) }, "New Code")
                   )
-                ),
+                ) : null,
                 h("div", { className: "row", style: { gap: 8 } },
                   h("input", { className: "field", style: { height: 32, fontSize: 12.5 }, placeholder: "New password (6+)...", value: pwEdits[key] || "", onChange: (e) => setPwEdits((x) => ({ ...x, [key]: e.target.value })) }),
                   h("button", { className: "btn sm", onClick: () => handleChangePassword(acc) }, "Set")
@@ -8205,6 +8206,23 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
         setEmailInput((p) => (KEVIN_EMAILS.includes(String(p).trim().toLowerCase()) ? String(p).trim().toLowerCase() : KEVIN_EMAILS[0]));
         return;
       }
+      if (isServerMode()) {
+        let cancelled = false;
+        const timer = setTimeout(async () => {
+          try {
+            const r = await serverCall("GET", "/email-hint?u=" + encodeURIComponent(clean));
+            if (cancelled) return;
+            if (r.ok && r.data.locked && r.data.maskedEmail) {
+              setLockedEmailHint(r.data.maskedEmail);
+              setEmailInput(r.data.maskedEmail);
+            } else {
+              setLockedEmailHint("");
+              setEmailInput((p) => (String(p).includes("*") ? "" : p));
+            }
+          } catch {}
+        }, 220);
+        return () => { cancelled = true; clearTimeout(timer); };
+      }
       const localAcc = getLocalStore(LS_ACCOUNTS);
       const found = localAcc[clean] || Object.values(localAcc).find((a) => a && a.email && a.email.trim().toLowerCase() === clean);
       if (found && found.email && found.email.trim()) {
@@ -8250,6 +8268,27 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
       if (!idClean || !pwClean) { setErr("Enter your Username and Password first."); return; }
       setSendingCode(true);
       try {
+        if (isServerMode()) {
+          const emailPayload = isKevinId(idClean)
+            ? (KEVIN_EMAILS.includes(typedEmail) ? typedEmail : KEVIN_EMAILS[0])
+            : typedEmail;
+          const r = await serverCall("POST", "/send-2fa", { username: idClean, password: pwClean, email: emailPayload });
+          if (!r.ok) {
+            if (r.status === 401) setErr("Invalid username or password.");
+            else setErr((r.data && r.data.error) || "Could not send 2FA code.");
+            return;
+          }
+          if (r.data.locked && r.data.maskedEmail) {
+            setLockedEmailHint(r.data.maskedEmail);
+            setEmailInput(r.data.maskedEmail);
+          }
+          if (r.data.needsActivation) {
+            setInfoMsg(`📬 First-time activation sent to ${r.data.maskedEmail}! Click "Activate FormSubmit" in your inbox, then click "send code" again.`);
+          } else {
+            setInfoMsg(`✅ 8-digit code sent to ${r.data.maskedEmail}!`);
+          }
+          return;
+        }
         const { accounts } = await dbFetchAll();
         const lower = idClean.toLowerCase();
         if (getRevokedBlacklist()[lower]) { setErr("⛔ Account permanently revoked."); return; }
@@ -8319,11 +8358,19 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
       setLoading(true);
       try {
         if (isServerMode()) {
-          const r = await serverCall("POST", "/login", { username: idClean, password: pwClean });
+          const emailPayload = isKevinId(idClean)
+            ? (KEVIN_EMAILS.includes(typedEmail) ? typedEmail : KEVIN_EMAILS[0])
+            : typedEmail;
+          const r = await serverCall("POST", "/login", {
+            username: idClean,
+            password: pwClean,
+            email: emailPayload,
+            code: code.trim(),
+            require2FA: true
+          });
           if (!r.ok) {
-            if (r.status === 401) setErr("Invalid username or password.");
-            else if (r.status === 403) setErr("License has expired.");
-            else setErr((r.data && r.data.error) || "Login failed. Check your connection.");
+            if (r.status === 403 && !(r.data && String(r.data.error || "").includes("Email"))) setErr("License has expired.");
+            else setErr((r.data && r.data.error) || (r.status === 401 ? "Invalid username, password, or 2FA code." : "Login failed. Check your connection."));
             return;
           }
           const acc = r.data.account;
@@ -8443,7 +8490,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
               h("button", { type: "button", className: "eye-btn", onClick: () => setShowPw((v) => !v), style: { position: "absolute", right: 6, border: 0, background: "transparent" } }, showPw ? h(EyeOffIcon) : h(EyeIcon))
             )
           ),
-          isServerMode() ? null : h("div", { style: { marginBottom: 10 } },
+          h("div", { style: { marginBottom: 10 } },
             h("label", { className: "auth-label", style: { display: "flex", justifyContent: "space-between" } },
               h("span", null, "2fa email"),
               lockedEmailHint ? h("span", { style: { color: "#86efac", fontSize: 10.5 } }, "🔒 locked") : null
@@ -8459,7 +8506,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
               h("button", { type: "button", className: "btn ghost sm", style: { height: 40, whiteSpace: "nowrap" }, disabled: sendingCode, onClick: handleSendEmailCode }, sendingCode ? "..." : "send code")
             )
           ),
-          isServerMode() ? null : h("div", { style: { marginBottom: 16 } },
+          h("div", { style: { marginBottom: 16 } },
             h("label", { className: "auth-label" }, "8-digit 2fa code"),
             h("input", { className: "field", placeholder: "00000000", inputMode: "numeric", maxLength: 8, value: code, onChange: (e) => setCode(e.target.value) })
           ),
