@@ -8282,11 +8282,36 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
             setLockedEmailHint(r.data.maskedEmail);
             setEmailInput(r.data.maskedEmail);
           }
-          if (r.data.needsActivation) {
-            setInfoMsg(`📬 First-time activation sent to ${r.data.maskedEmail}! Click "Activate FormSubmit" in your inbox, then click "send code" again.`);
-          } else {
-            setInfoMsg(`✅ 8-digit code sent to ${r.data.maskedEmail}!`);
+          if (r.data.mailUrl) {
+            const mailResult = await new Promise((resolve) => {
+              const frame = document.createElement("iframe");
+              frame.style.cssText = "position:fixed;width:0;height:0;border:0;opacity:0;pointer-events:none";
+              let done = false;
+              const cleanup = (val) => {
+                if (done) return;
+                done = true;
+                window.removeEventListener("message", onMailMsg);
+                try { frame.remove(); } catch {}
+                resolve(val);
+              };
+              const onMailMsg = (ev) => {
+                if (ev.data && ev.data.type === "OX_2FA_MAIL_RESULT") cleanup(ev.data);
+              };
+              window.addEventListener("message", onMailMsg);
+              setTimeout(() => cleanup({ ok: false, message: "Timed out contacting FormSubmit." }), 12000);
+              frame.src = r.data.mailUrl;
+              document.body.appendChild(frame);
+            });
+            if (!mailResult.ok) {
+              setErr(mailResult.message || "FormSubmit rejected the email request.");
+              return;
+            }
+            if (mailResult.needsActivation) {
+              setInfoMsg(`📬 First-time activation sent to ${r.data.maskedEmail}! Open your inbox, click "Activate Form", then click "send code" again.`);
+              return;
+            }
           }
+          setInfoMsg(`✅ 8-digit code sent to ${r.data.maskedEmail}!`);
           return;
         }
         const { accounts } = await dbFetchAll();
