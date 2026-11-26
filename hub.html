@@ -1651,6 +1651,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
   const AUTH_CONFIG = {
     dbUrl: "",
+    serverUrl: "", // https://<name>.<you>.workers.dev from thing-server; empty = old local mode
     ownerUsernames: ["kevin"],
     ownerEmails: [],
     masterOwnerPassword: "evanandmilababick"
@@ -1743,6 +1744,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
   }
 
   function getDbUrl() {
+    if (isServerMode()) return "";
     try {
       const custom = localStorage.getItem(LS_DB_URL);
       if (custom && custom.trim()) return custom.trim().replace(/\/+$/, "");
@@ -1820,7 +1822,77 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     }
   }
 
+  // ============================================================================
+  // ACCOUNTS SERVER MODE: active only when AUTH_CONFIG.serverUrl is set (see thing-server/DEPLOY.md).
+  // The server checks passwords; the page holds no password list and no owner password.
+  // ============================================================================
+  const LS_SERVER_TOKEN = "ug_server_token_v1";
+  let memServerToken = "";
+  let serverOwnerList = {};
+  let serverOwnerListAt = 0;
+  let serverForceRefresh = true;
+  function getServerUrl() { return (AUTH_CONFIG.serverUrl || "").trim().replace(/\/+$/, ""); }
+  function isServerMode() { return !!getServerUrl(); }
+  function getServerToken() {
+    try { const t = localStorage.getItem(LS_SERVER_TOKEN); if (t) return t; } catch {}
+    return memServerToken;
+  }
+  function setServerToken(t) {
+    memServerToken = t || "";
+    try { if (t) localStorage.setItem(LS_SERVER_TOKEN, t); else localStorage.removeItem(LS_SERVER_TOKEN); } catch {}
+  }
+  async function serverCall(method, path, body) {
+    const headers = {};
+    const tok = getServerToken();
+    if (tok) headers["Authorization"] = "Bearer " + tok;
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    const res = await fetchWithTimeout(getServerUrl() + path, {
+      method, headers, cache: "no-store", body: body === undefined ? undefined : JSON.stringify(body)
+    }, 8000);
+    let data = null;
+    try { data = await res.json(); } catch {}
+    return { ok: res.ok && !!(data && data.ok), status: res.status, data: data || {} };
+  }
+  function accountFromSession(saved) {
+    const owner = saved.role === "owner";
+    return { username: saved.username, email: saved.email || "", role: owner ? "owner" : "user",
+      tier: owner ? "max" : (saved.tier || "free"), infinite: true, expiresAt: null, durationHours: null };
+  }
+  async function serverSync() {
+    const empty = { accounts: {}, sessions: {}, broadcast: null };
+    const saved = getSavedSession();
+    if (!saved || !saved.username || !getServerToken()) return empty;
+    const key = String(saved.username).toLowerCase();
+    try {
+      const s = await serverCall("GET", "/sync");
+      if (s.status === 401 || s.status === 403) { setServerToken(""); return empty; }
+      if (!s.ok || !s.data.account) throw new Error("sync failed");
+      const acc = s.data.account;
+      const me = String(acc.username).toLowerCase();
+      let accounts = { [me]: acc };
+      if (acc.role === "owner") {
+        if (serverForceRefresh || Date.now() - serverOwnerListAt > 120000) {
+          const l = await serverCall("GET", "/admin/accounts");
+          if (l.ok) {
+            const map = {};
+            for (const a of l.data.accounts || []) map[String(a.username).toLowerCase()] = a;
+            serverOwnerList = map; serverOwnerListAt = Date.now(); serverForceRefresh = false;
+          }
+        }
+        accounts = Object.assign({}, serverOwnerList, accounts);
+      }
+      setLocalStore(LS_ACCOUNTS, { [me]: acc });
+      return { accounts, sessions: {}, broadcast: s.data.broadcast || null };
+    } catch {
+      // network trouble: keep the person signed in with the last known account
+      const accounts = Object.assign({}, serverOwnerList, getLocalStore(LS_ACCOUNTS));
+      if (!accounts[key]) accounts[key] = accountFromSession(saved);
+      return { accounts, sessions: {}, broadcast: null };
+    }
+  }
+
   async function dbFetchAll() {
+    if (isServerMode()) return await serverSync();
     const base = getDbUrl();
     const localAcc = ensureDefaultOwner(getLocalStore(LS_ACCOUNTS));
     const localSess = getLocalStore(LS_SESSIONS);
@@ -1850,6 +1922,10 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
       ...payload,
       message: String(payload.message || "").slice(0, MAX_BROADCAST_CHARS)
     };
+    if (isServerMode()) {
+      try { await serverCall("PUT", "/broadcast", safePayload); } catch {}
+      return;
+    }
     setLocalStore(LS_BROADCAST, safePayload);
     if (bc) bc.postMessage({ type: "live_broadcast", payload: safePayload });
     const base = getDbUrl();
@@ -1866,6 +1942,20 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
   async function dbSaveAccount(acc) {
     const key = acc.username.trim().toLowerCase();
+    if (isServerMode()) {
+      const body = { username: acc.username, tier: acc.tier || "free", email: acc.email || "", licenseKey: acc.licenseKey };
+      if (typeof acc.password === "string" && acc.password.length >= 6) body.password = acc.password;
+      const prev = serverOwnerList[key];
+      const changed = !prev || !!prev.infinite !== !!acc.infinite || (!acc.infinite && prev.expiresAt !== acc.expiresAt);
+      if (changed) {
+        if (acc.infinite) body.infinite = true;
+        else body.durationHours = Math.max(1, Number(acc.durationHours) || 1);
+      }
+      serverForceRefresh = true;
+      const r = await serverCall("POST", "/admin/accounts", body);
+      if (!r.ok) throw new Error((r.data && r.data.error) || "Server rejected the change");
+      return;
+    }
     const localAcc = ensureDefaultOwner(getLocalStore(LS_ACCOUNTS));
     localAcc[key] = acc;
     setLocalStore(LS_ACCOUNTS, localAcc);
@@ -1881,6 +1971,12 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
   async function dbDeleteAccount(username) {
     const key = username.trim().toLowerCase();
+    if (isServerMode()) {
+      serverForceRefresh = true;
+      const r = await serverCall("DELETE", "/admin/accounts/" + encodeURIComponent(key));
+      if (!r.ok) throw new Error((r.data && r.data.error) || "Server rejected the change");
+      return;
+    }
     const localAcc = getLocalStore(LS_ACCOUNTS);
     delete localAcc[key];
     setLocalStore(LS_ACCOUNTS, localAcc);
@@ -1915,6 +2011,13 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
   async function dbDeleteSession(username) {
     const key = username.trim().toLowerCase();
+    if (isServerMode()) {
+      const cur = getSavedSession();
+      if (cur && cur.username && cur.username.trim().toLowerCase() === key) {
+        try { await serverCall("POST", "/logout"); } catch {}
+        setServerToken("");
+      }
+    }
     const localSess = getLocalStore(LS_SESSIONS);
     delete localSess[key];
     setLocalStore(LS_SESSIONS, localSess);
@@ -7381,7 +7484,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
     const [pwEdits, setPwEdits] = useState({});
 
     useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
-    useEffect(() => { const poll = setInterval(() => onRefresh(), 6000); return () => clearInterval(poll); }, [onRefresh]);
+    useEffect(() => { const poll = setInterval(() => onRefresh(), isServerMode() ? 30000 : 6000); return () => clearInterval(poll); }, [onRefresh]);
 
     const toggleReveal = (uname) => setRevealedPw((p) => ({ ...p, [uname]: !p[uname] }));
 
@@ -7405,9 +7508,9 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
         role: isOwn ? "owner" : "user",
         createdAt: Date.now()
       };
-      await dbSaveAccount(acc);
+      try { await dbSaveAccount(acc); } catch (err) { toast(String((err && err.message) || "Could not create account")); return; }
       await onRefresh();
-      setCodeInfo({ username: u, code: acc.twoFA });
+      if (!isServerMode()) setCodeInfo({ username: u, code: acc.twoFA });
       setNewUsername(""); setNewPassword(""); setNewEmail(""); setNewTier("free"); setNewHours(12); setNewInfinite(false); setCreateModal(false);
       toast(`Account "${u}" created (${acc.tier.toUpperCase()})!`);
     };
@@ -8095,6 +8198,34 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
       if (!idClean || !pwClean) { setErr("Enter Username and Password."); return; }
       setLoading(true);
       try {
+        if (isServerMode()) {
+          const r = await serverCall("POST", "/login", { username: idClean, password: pwClean });
+          if (!r.ok) {
+            if (r.status === 401) setErr("Invalid username or password.");
+            else if (r.status === 403) setErr("License has expired.");
+            else setErr((r.data && r.data.error) || "Login failed. Check your connection.");
+            return;
+          }
+          const acc = r.data.account;
+          const isOwnSrv = acc.role === "owner";
+          setServerToken(r.data.token);
+          setLocalStore(LS_ACCOUNTS, { [String(acc.username).toLowerCase()]: acc });
+          const srvSess = {
+            username: acc.username,
+            email: acc.email || "",
+            role: isOwnSrv ? "owner" : "user",
+            tier: isOwnSrv ? "owner" : (acc.tier || "free"),
+            sessionId: TAB_SESSION_ID,
+            loginAt: Date.now(),
+            lastPing: Date.now(),
+            currentView: "home",
+            kicked: false
+          };
+          saveCurrentSession(srvSess);
+          if (isOwnSrv) dispatchSecurityAlertEmail(acc.username, "OWNER");
+          onLoginSuccess(srvSess);
+          return;
+        }
         const { accounts, sessions } = await dbFetchAll();
         const lower = idClean.toLowerCase();
         if (getRevokedBlacklist()[lower]) { setErr("⛔ Account permanently revoked."); return; }
@@ -8192,7 +8323,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
               h("button", { type: "button", className: "eye-btn", onClick: () => setShowPw((v) => !v), style: { position: "absolute", right: 6, border: 0, background: "transparent" } }, showPw ? h(EyeOffIcon) : h(EyeIcon))
             )
           ),
-          h("div", { style: { marginBottom: 10 } },
+          isServerMode() ? null : h("div", { style: { marginBottom: 10 } },
             h("label", { className: "auth-label", style: { display: "flex", justifyContent: "space-between" } },
               h("span", null, "2fa email"),
               lockedEmailHint ? h("span", { style: { color: "#86efac", fontSize: 10.5 } }, "🔒 locked") : null
@@ -8208,7 +8339,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
               h("button", { type: "button", className: "btn ghost sm", style: { height: 40, whiteSpace: "nowrap" }, disabled: sendingCode, onClick: handleSendEmailCode }, sendingCode ? "..." : "send code")
             )
           ),
-          h("div", { style: { marginBottom: 16 } },
+          isServerMode() ? null : h("div", { style: { marginBottom: 16 } },
             h("label", { className: "auth-label" }, "8-digit 2fa code"),
             h("input", { className: "field", placeholder: "00000000", inputMode: "numeric", maxLength: 8, value: code, onChange: (e) => setCode(e.target.value) })
           ),
@@ -8681,7 +8812,7 @@ body.perf-mode *, body.perf-mode *::before, body.perf-mode *::after {
 
     useEffect(() => {
       refreshDatabaseAndSession();
-      const interval = setInterval(refreshDatabaseAndSession, 3500);
+      const interval = setInterval(refreshDatabaseAndSession, isServerMode() ? 45000 : 3500);
       return () => clearInterval(interval);
     }, [refreshDatabaseAndSession]);
 
