@@ -167,8 +167,8 @@ const CHAT_CSS = `
 }
 `;
 
-if (html.includes(".dc-guild-item")) {
-  log.push("skip (v4 Discord UI already present): chat polish CSS");
+if (html.includes(".dc-guild-item") || html.includes('id="x0c"')) {
+  log.push("skip (99nz/v4 Discord UI already present): chat polish CSS");
 } else {
   once(
     "chat polish CSS",
