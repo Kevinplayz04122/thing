@@ -167,12 +167,16 @@ const CHAT_CSS = `
 }
 `;
 
-once(
-  "chat polish CSS",
-  "/* OXYGEN-CHAT-POLISH-V4 */",
-  '</style><script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js">',
-  (a) => CHAT_CSS + a
-);
+if (html.includes(".dc-guild-item")) {
+  log.push("skip (v4 Discord UI already present): chat polish CSS");
+} else {
+  once(
+    "chat polish CSS",
+    "/* OXYGEN-CHAT-POLISH-V4 */",
+    "</style>",
+    (a) => CHAT_CSS + a
+  );
+}
 
 {
   const from = '"Supports **Markdown**, @mentions, /commands, replies, reactions, GIFs & voice memos."';
