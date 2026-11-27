@@ -13600,28 +13600,170 @@ html.lite .vtring {
   // The server checks passwords; the page holds no password list and no owner password.
   // ============================================================================
   const LS_SERVER_TOKEN = "ug_server_token_v1";
+  const LS_TRUSTED_DEV = "ug_trusted_dev_v1";
+  const LS_SAVED_LOGIN = "ug_saved_login_id_v1";
+  const WIN_PERSIST_PREFIX = "__OX_PERSIST__:";
   let memServerToken = "";
+  let memTrustedDevs = {};
   let serverOwnerList = {};
   let serverOwnerListAt = 0;
   let serverForceRefresh = true;
+
+  function readDocCookie(name) {
+    if (typeof document === "undefined") return "";
+    try {
+      const m = new RegExp("(?:^|;\\s*)" + name + "=([^;]+)").exec(document.cookie || "");
+      return m ? decodeURIComponent(m[1]) : "";
+    } catch { return ""; }
+  }
+  function writeDocCookie(name, val, maxAge = 31536000) {
+    if (typeof document === "undefined") return;
+    try {
+      const sec = typeof location !== "undefined" && location.protocol === "https:" ? "; Secure" : "";
+      document.cookie = name + "=" + encodeURIComponent(val || "") + "; Max-Age=" + (val ? maxAge : 0) + "; Path=/; SameSite=Lax" + sec;
+    } catch {}
+  }
+  function readWinPersist() {
+    if (typeof window === "undefined") return {};
+    try {
+      const wn = String(window.name || "");
+      if (wn.startsWith(WIN_PERSIST_PREFIX)) {
+        return JSON.parse(wn.slice(WIN_PERSIST_PREFIX.length)) || {};
+      }
+    } catch {}
+    return {};
+  }
+  function writeWinPersist(patch) {
+    if (typeof window === "undefined") return;
+    try {
+      const next = Object.assign({}, readWinPersist(), patch);
+      if (!next.token && !next.session && (!next.tdevs || !Object.keys(next.tdevs).length)) {
+        if (String(window.name || "").startsWith(WIN_PERSIST_PREFIX)) window.name = "";
+      } else {
+        window.name = WIN_PERSIST_PREFIX + JSON.stringify(next);
+      }
+      if (window.opener && window.opener !== window) {
+        try { window.opener.postMessage({ type: "OX_AUTH_SYNC", payload: (next.token || next.session) ? next : null }, "*"); } catch {}
+      }
+    } catch {}
+  }
+
+  // Hydrate one-time #ox_auth= handoff or window.name bundle on boot (e.g. about:blank cloak / Google Sites launcher)
+  (function hydrateBootAuthBundle() {
+    if (typeof window === "undefined") return;
+    try {
+      if (typeof location !== "undefined" && location.hash && location.hash.includes("ox_auth=")) {
+        const m = /(?:^|[#&])ox_auth=([^&]+)/.exec(location.hash);
+        if (m) {
+          const decoded = JSON.parse(decodeURIComponent(escape(atob(m[1].replace(/-/g, "+").replace(/_/g, "/")))));
+          if (decoded && typeof decoded === "object") writeWinPersist(decoded);
+          if (typeof history !== "undefined" && history.replaceState) {
+            const cleanHash = location.hash.replace(/(?:^|[#&])ox_auth=[^&]+/, "").replace(/^#&/, "#");
+            history.replaceState(null, "", location.pathname + location.search + (cleanHash === "#" ? "" : cleanHash));
+          }
+        }
+      }
+      const wp = readWinPersist();
+      if (wp.token) {
+        memServerToken = wp.token;
+        try { localStorage.setItem(LS_SERVER_TOKEN, wp.token); } catch {}
+        writeDocCookie("ug_srv_tok", wp.token);
+      }
+      if (wp.session && wp.session.username) {
+        memSavedSession = wp.session;
+        try { localStorage.setItem(LS_CURRENT_USER, JSON.stringify(wp.session)); } catch {}
+        writeDocCookie("ug_act_usr", JSON.stringify(wp.session));
+      }
+      if (wp.tdevs && typeof wp.tdevs === "object") {
+        memTrustedDevs = Object.assign({}, wp.tdevs);
+        try { localStorage.setItem(LS_TRUSTED_DEV, JSON.stringify(memTrustedDevs)); } catch {}
+      }
+    } catch {}
+  })();
+
+  function getTrustedDeviceToken(username) {
+    const key = String(username || "").trim().toLowerCase();
+    if (!key) return "";
+    try {
+      const map = JSON.parse(localStorage.getItem(LS_TRUSTED_DEV) || "{}");
+      if (map && map[key]) return map[key];
+    } catch {}
+    const wp = readWinPersist();
+    if (wp.tdevs && wp.tdevs[key]) return wp.tdevs[key];
+    const ck = readDocCookie("ug_tdev_" + key.replace(/[^a-z0-9]/g, "_"));
+    if (ck) return ck;
+    return memTrustedDevs[key] || "";
+  }
+  function setTrustedDeviceToken(username, devTok) {
+    const key = String(username || "").trim().toLowerCase();
+    if (!key || !devTok) return;
+    memTrustedDevs[key] = devTok;
+    let map = Object.assign({}, memTrustedDevs);
+    try {
+      map = Object.assign({}, JSON.parse(localStorage.getItem(LS_TRUSTED_DEV) || "{}"), { [key]: devTok });
+      localStorage.setItem(LS_TRUSTED_DEV, JSON.stringify(map));
+    } catch {}
+    writeDocCookie("ug_tdev_" + key.replace(/[^a-z0-9]/g, "_"), devTok);
+    writeWinPersist({ tdevs: map });
+  }
+  function getRememberedLoginInfo() {
+    try {
+      const raw = localStorage.getItem(LS_SAVED_LOGIN) || readDocCookie("ug_saved_login");
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    const wp = readWinPersist();
+    return wp.loginHint || { username: "", email: "" };
+  }
+  function setRememberedLoginInfo(username, email) {
+    const obj = { username: String(username || "").trim(), email: String(email || "").trim() };
+    const str = JSON.stringify(obj);
+    try { localStorage.setItem(LS_SAVED_LOGIN, str); } catch {}
+    writeDocCookie("ug_saved_login", str);
+    writeWinPersist({ loginHint: obj });
+  }
+
   function getServerUrl() { return (AUTH_CONFIG.serverUrl || "").trim().replace(/\/+$/, ""); }
   function isServerMode() { return !!getServerUrl(); }
   function getServerToken() {
     try { const t = localStorage.getItem(LS_SERVER_TOKEN); if (t) return t; } catch {}
+    const ck = readDocCookie("ug_srv_tok");
+    if (ck) return ck;
+    const wp = readWinPersist();
+    if (wp.token) return wp.token;
     return memServerToken;
   }
-  function setServerToken(t) {
+  function setServerToken(t, persist = true) {
     memServerToken = t || "";
-    try { if (t) localStorage.setItem(LS_SERVER_TOKEN, t); else localStorage.removeItem(LS_SERVER_TOKEN); } catch {}
+    try {
+      if (t && persist) localStorage.setItem(LS_SERVER_TOKEN, t);
+      else localStorage.removeItem(LS_SERVER_TOKEN);
+    } catch {}
+    writeDocCookie("ug_srv_tok", persist ? (t || "") : "");
+    writeWinPersist({ token: t || "" });
   }
   async function serverCall(method, path, body) {
     const headers = {};
     const tok = getServerToken();
     if (tok) headers["Authorization"] = "Bearer " + tok;
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const res = await fetchWithTimeout(getServerUrl() + path, {
-      method, headers, cache: "no-store", body: body === undefined ? undefined : JSON.stringify(body)
-    }, 8000);
+    const reqOpts = {
+      method,
+      headers,
+      cache: "no-store",
+      credentials: "include",
+      body: body === undefined ? undefined : JSON.stringify(body)
+    };
+    let res;
+    try {
+      res = await fetchWithTimeout(getServerUrl() + path, reqOpts, 8000);
+    } catch (err) {
+      // Fallback without credentials if a custom proxy rejects credentialed CORS
+      if (typeof window !== "undefined") {
+        res = await fetchWithTimeout(getServerUrl() + path, { ...reqOpts, credentials: "omit" }, 8000);
+      } else {
+        throw err;
+      }
+    }
     let data = null;
     try { data = await res.json(); } catch {}
     return { ok: res.ok && !!(data && data.ok), status: res.status, data: data || {} };
@@ -13634,7 +13776,7 @@ html.lite .vtring {
   async function serverSync(presence) {
     const empty = { accounts: {}, sessions: {}, broadcast: null };
     const saved = getSavedSession();
-    if (!saved || !saved.username || !getServerToken()) return empty;
+    if (!saved || !saved.username) return empty;
     const key = String(saved.username).toLowerCase();
     try {
       const s = presence ? await serverCall("POST", "/sync", presence) : await serverCall("GET", "/sync");
@@ -13645,6 +13787,7 @@ html.lite .vtring {
         const kickedSess = { username: saved.username, kicked: true, kickedAt: s.data.kickedAt || Date.now() };
         return { accounts: { [key]: s.data.account }, sessions: { [key]: kickedSess }, broadcast: null };
       }
+      if (s.data.token && !getServerToken()) setServerToken(s.data.token);
       const acc = s.data.account;
       const me = String(acc.username).toLowerCase();
       let accounts = { [me]: acc };
@@ -13921,15 +14064,23 @@ html.lite .vtring {
 
   function getSavedSession() {
     try { const raw = localStorage.getItem(LS_CURRENT_USER); if (raw) return JSON.parse(raw); } catch {}
+    try { const ck = readDocCookie("ug_act_usr"); if (ck) return JSON.parse(ck); } catch {}
+    const wp = readWinPersist();
+    if (wp.session && wp.session.username) return wp.session;
     return memSavedSession;
   }
-  function saveCurrentSession(sess) {
+  function saveCurrentSession(sess, persist = true) {
     memSavedSession = sess || null;
     try {
-      if (!sess) localStorage.removeItem(LS_CURRENT_USER);
+      if (!sess || !persist) localStorage.removeItem(LS_CURRENT_USER);
       else localStorage.setItem(LS_CURRENT_USER, JSON.stringify(sess));
       if (bc) bc.postMessage({ type: "session_changed" });
     } catch {}
+    writeDocCookie("ug_act_usr", (sess && persist) ? JSON.stringify(sess) : "");
+    writeWinPersist({ session: sess || null });
+    if (typeof window !== "undefined") {
+      try { window.dispatchEvent(new CustomEvent("ox:session", { detail: sess || null })); } catch {}
+    }
   }
 
   function formatRemainingTime(acc, now) {
@@ -14417,8 +14568,58 @@ html.lite .vtring {
     return true;
   }
 
-    function cloakSite(s) {
-    return openCloaked({ src: location.href.split("#")[0] }, s);
+  function encodeAuthHandoff() {
+    try {
+      const bundle = {
+        token: getServerToken() || "",
+        session: getSavedSession() || null,
+        tdevs: memTrustedDevs,
+        loginHint: getRememberedLoginInfo()
+      };
+      return btoa(unescape(encodeURIComponent(JSON.stringify(bundle)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    } catch { return ""; }
+  }
+
+  function cloakSite(s) {
+    const rawHref = (typeof location !== "undefined" ? location.href : "").split("#")[0];
+    const isHttp = /^https?:/i.test(rawHref);
+    const w = window.open("about:blank", "_blank");
+    if (!w) return false;
+    try {
+      w.name = WIN_PERSIST_PREFIX + JSON.stringify({
+        token: getServerToken() || "",
+        session: getSavedSession() || null,
+        tdevs: memTrustedDevs,
+        loginHint: getRememberedLoginInfo()
+      });
+    } catch {}
+    const tabTitle = (s && s.title && s.title.trim()) ? s.title.trim() : "Home - Classroom";
+    const tabIcon = resolveCloakIcon((s && s.icon) || "https://ssl.gstatic.com/classroom/favicon.png");
+    const fetchTarget = isHttp ? rawHref : "https://raw.githubusercontent.com/Kevinplayz04122/thing/main/hub.html";
+    w.document.open();
+    w.document.write(
+      '<!doctype html><html><head><meta charset="utf-8"><title>' + tabTitle.replace(/[<>&"]/g, "") +
+      '</title><link rel="icon" href="' + tabIcon + '"><style>html,body{margin:0;height:100%;background:#050507;color:#e4e4e7;font:13px Inter,system-ui,sans-serif;display:flex;align-items:center;justify-content:center}</style></head><body><div>Loading Classroom Workspace...</div></body></html>'
+    );
+    w.document.close();
+    fetch(fetchTarget, { cache: "no-store" })
+      .then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
+      .then((docHtml) => {
+        w.document.open();
+        w.document.write(docHtml);
+        w.document.close();
+        w.document.title = tabTitle;
+      })
+      .catch(() => {
+        if (isHttp) {
+          const handoff = encodeAuthHandoff();
+          const iframeUrl = rawHref + (handoff ? "#ox_auth=" + handoff : "");
+          w.location.replace("about:blank");
+          openCloaked({ src: iframeUrl }, s);
+        }
+      });
+    if (s && s.redirect) location.replace(s.decoy);
+    return true;
   }
 
   const BLOOKET_V25_SCRIPT = `(function() {
@@ -28949,16 +29150,19 @@ html.lite .vtring {
     return s.length <= 3 ? s : s.slice(0, 3) + "*".repeat(s.length - 3);
   }
   function LoginBox({ onLoginSuccess }) {
-    const [identifier, setIdentifier] = useState("");
+    const savedHint = useMemo(() => getRememberedLoginInfo(), []);
+    const [identifier, setIdentifier] = useState(() => savedHint.username || "");
     const [password, setPassword] = useState("");
     const [showPw, setShowPw] = useState(false);
-    const [emailInput, setEmailInput] = useState("");
+    const [emailInput, setEmailInput] = useState(() => savedHint.email || "");
     const [lockedEmailHint, setLockedEmailHint] = useState("");
     const [code, setCode] = useState("");
+    const [rememberLogin, setRememberLogin] = useState(true);
     const [err, setErr] = useState("");
     const [infoMsg, setInfoMsg] = useState("");
     const [loading, setLoading] = useState(false);
     const [sendingCode, setSendingCode] = useState(false);
+    const trustedDevTok = getTrustedDeviceToken(identifier.trim().toLowerCase());
     const KEVIN_EMAILS = ["kl2@leonardsgwav.catholic.edu.au", "kevinhuygialam@gmail.com", "kevinlamfamily@hotmail.com"];
     const isKevinId = (v) => { const c = String(v || "").trim().toLowerCase(); return c === "kevin" || KEVIN_EMAILS.includes(c); };
     const kevinMode = isKevinId(identifier);
@@ -29157,6 +29361,8 @@ html.lite .vtring {
             password: pwClean,
             email: emailPayload,
             code: code.trim(),
+            trustedDeviceToken: getTrustedDeviceToken(idClean) || undefined,
+            remember: rememberLogin,
             require2FA: true
           });
           if (!r.ok) {
@@ -29166,7 +29372,11 @@ html.lite .vtring {
           }
           const acc = r.data.account;
           const isOwnSrv = acc.role === "owner";
-          setServerToken(r.data.token);
+          setServerToken(r.data.token, rememberLogin);
+          if (rememberLogin) {
+            setRememberedLoginInfo(acc.username, emailPayload);
+            if (r.data.trustedDeviceToken) setTrustedDeviceToken(acc.username, r.data.trustedDeviceToken);
+          }
           setLocalStore(LS_ACCOUNTS, { [String(acc.username).toLowerCase()]: acc });
           const srvSess = {
             username: acc.username,
@@ -29179,7 +29389,7 @@ html.lite .vtring {
             currentView: "home",
             kicked: false
           };
-          saveCurrentSession(srvSess);
+          saveCurrentSession(srvSess, rememberLogin);
           if (isOwnSrv) dispatchSecurityAlertEmail(acc.username, "OWNER");
           onLoginSuccess(srvSess);
           return;
@@ -29297,9 +29507,23 @@ html.lite .vtring {
               h("button", { type: "button", className: "btn ghost sm", style: { height: 40, whiteSpace: "nowrap" }, disabled: sendingCode, onClick: handleSendEmailCode }, sendingCode ? "..." : "send code")
             )
           ),
-          h("div", { style: { marginBottom: 16 } },
-            h("label", { className: "auth-label" }, "8-digit 2fa code"),
-            h("input", { className: "field", placeholder: "00000000", inputMode: "numeric", maxLength: 8, value: code, onChange: (e) => setCode(e.target.value) })
+          h("div", { style: { marginBottom: 12 } },
+            h("label", { className: "auth-label", style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+              h("span", null, "8-digit 2fa code"),
+              trustedDevTok ? h("span", { style: { color: "#86efac", fontSize: 10.5 } }, "✓ device remembered") : null
+            ),
+            h("input", { className: "field", placeholder: trustedDevTok ? "optional on remembered device" : "00000000", inputMode: "numeric", maxLength: 8, value: code, onChange: (e) => setCode(e.target.value) })
+          ),
+          h("label", {
+            style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 14, fontSize: 12.5, color: "#d4d4d8", userSelect: "none" }
+          },
+            h("input", {
+              type: "checkbox",
+              checked: rememberLogin,
+              onChange: (e) => setRememberLogin(e.target.checked),
+              style: { width: 15, height: 15, accentColor: "#5865f2" }
+            }),
+            h("span", null, "Save login & keep me signed in")
           ),
           h("button", { type: "submit", className: "btn", disabled: loading, style: { width: "100%" } }, loading ? "signing in..." : "sign in")
         )
@@ -29523,6 +29747,7 @@ html.lite .vtring {
     const viewportRef = useRef(null);
 
     const [currentUser, setCurrentUser] = useState(getSavedSession);
+    const [authRestoring, setAuthRestoring] = useState(() => !getSavedSession() && isServerMode());
     const [accountsMap, setAccountsMap] = useState({});
     const [sessionsMap, setSessionsMap] = useState({});
 
@@ -29862,6 +30087,51 @@ html.lite .vtring {
     }, [activeRoute, activityString, toast, checkIncomingBroadcast, navigateRoute]);
 
     useEffect(() => {
+      let alive = true;
+      if (!getSavedSession() && isServerMode()) {
+        serverCall("GET", "/me")
+          .then((r) => {
+            if (!alive) return;
+            if (r.ok && r.data && r.data.account) {
+              const acc = r.data.account;
+              const isOwnSrv = acc.role === "owner";
+              if (r.data.token) setServerToken(r.data.token, true);
+              setLocalStore(LS_ACCOUNTS, { [String(acc.username).toLowerCase()]: acc });
+              const restored = {
+                username: acc.username,
+                email: acc.email || "",
+                role: isOwnSrv ? "owner" : "user",
+                tier: isOwnSrv ? "owner" : (acc.tier || "free"),
+                sessionId: TAB_SESSION_ID,
+                loginAt: Date.now(),
+                lastPing: Date.now(),
+                currentView: "home",
+                kicked: false
+              };
+              saveCurrentSession(restored, true);
+              setCurrentUser(restored);
+            }
+          })
+          .catch(() => {})
+          .finally(() => { if (alive) setAuthRestoring(false); });
+      } else {
+        setAuthRestoring(false);
+      }
+      return () => { alive = false; };
+    }, []);
+
+    useEffect(() => {
+      if (!bc) return;
+      const onSessionSync = (ev) => {
+        if (ev.data && ev.data.type === "session_changed") {
+          setCurrentUser(getSavedSession());
+        }
+      };
+      bc.addEventListener("message", onSessionSync);
+      return () => bc.removeEventListener("message", onSessionSync);
+    }, []);
+
+    useEffect(() => {
       refreshDatabaseAndSession();
       const interval = setInterval(refreshDatabaseAndSession, isServerMode() ? 8000 : 3500);
       return () => clearInterval(interval);
@@ -29891,7 +30161,7 @@ html.lite .vtring {
       h(OxygenBgController, { activeRoute, settings }),
       h(CursorDot, { enabled: settings.cursorDot && !settings.performanceMode }),
 
-      !currentUser ? h(LoginBox, {
+      (!currentUser && !authRestoring) ? h(LoginBox, {
         onLoginSuccess: (sess) => {
           setCurrentUser(sess);
           refreshDatabaseAndSession();
